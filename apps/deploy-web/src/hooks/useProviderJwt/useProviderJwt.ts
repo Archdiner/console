@@ -1,41 +1,43 @@
 import { useCallback, useEffect, useMemo } from "react";
-import { JwtTokenManager, type JwtTokenPayload } from "@akashnetwork/chain-sdk/web";
+import { JwtTokenManager } from "@akashnetwork/chain-sdk/web";
 import { atom, useAtom } from "jotai";
 
 import { useServices } from "@src/context/ServicesProvider";
 import { useWallet } from "@src/context/WalletProvider";
-import { useSelectedChain } from "../useSelectedChain/useSelectedChain";
+import { useUser } from "@src/hooks/useUser";
 
 const JWT_TOKEN_ATOM = atom<string | null>(null);
 
 export const DEPENDENCIES = {
-  useSelectedChain,
   useWallet,
+  useUser,
   useServices
 };
 
 export function useProviderJwt({ dependencies: d = DEPENDENCIES }: { dependencies?: typeof DEPENDENCIES } = {}): UseProviderJwtResult {
-  const { storedWalletsService, networkStore, consoleApiHttpClient } = d.useServices();
-  const { isManaged, address, isWalletConnected } = d.useWallet();
-  const selectedChain = d.useSelectedChain();
-  const selectedNetworkId = networkStore.useSelectedNetworkId();
+  const { storedWalletsService, consoleApiHttpClient } = d.useServices();
+  const { isWalletConnected } = d.useWallet();
+  const { user } = d.useUser();
+  const userId = user?.id;
   const [accessToken, setAccessToken] = useAtom(JWT_TOKEN_ATOM);
 
   useEffect(() => {
-    const token = storedWalletsService.getStorageWallets(selectedNetworkId).find(w => w.address === address)?.token;
+    if (!userId) {
+      setAccessToken(null);
+      return;
+    }
+    const token = storedWalletsService.getStorageManagedWallet(userId)?.token;
     setAccessToken(token || null);
-  }, [storedWalletsService, selectedNetworkId, address]);
+  }, [storedWalletsService, userId, setAccessToken]);
 
   const jwtTokenManager = useMemo(
     () =>
       new JwtTokenManager({
-        signArbitrary: selectedChain
-          ? selectedChain.signArbitrary
-          : () => {
-              throw new Error("Cannot sign jwt token: custodial wallet not found");
-            }
+        signArbitrary: () => {
+          throw new Error("Cannot sign jwt token: managed wallet uses server-side signing");
+        }
       }),
-    [selectedChain]
+    []
   );
   const parsedToken = useMemo(() => {
     if (!accessToken) return null;
@@ -46,36 +48,25 @@ export function useProviderJwt({ dependencies: d = DEPENDENCIES }: { dependencie
     if (!isWalletConnected) {
       throw new Error("Cannot generate JWT: wallet is not connected");
     }
-
-    const leasesAccess: JwtTokenPayload["leases"] = {
-      access: "scoped",
-      scope: ["status", "shell", "events", "logs"]
-    };
-    const tokenLifetimeInSeconds = 30 * 60;
-    let token: string;
-    if (isManaged) {
-      const response = await consoleApiHttpClient.post<{ data: { token: string } }>("/v1/create-jwt-token", {
-        data: {
-          ttl: tokenLifetimeInSeconds,
-          leases: leasesAccess
-        }
-      });
-      token = response.data.data.token;
-    } else {
-      const now = Math.floor(Date.now() / 1000);
-      token = await jwtTokenManager.generateToken({
-        version: "v1",
-        iss: address,
-        exp: now + tokenLifetimeInSeconds,
-        iat: now,
-        leases: leasesAccess
-      });
+    if (!userId) {
+      throw new Error("Cannot generate JWT: user is not authenticated");
     }
 
-    storedWalletsService.updateWallet(address, w => ({ ...w, token }));
+    const response = await consoleApiHttpClient.post<{ data: { token: string } }>("/v1/create-jwt-token", {
+      data: {
+        ttl: 30 * 60,
+        leases: {
+          access: "scoped",
+          scope: ["status", "shell", "events", "logs"]
+        }
+      }
+    });
+    const token = response.data.data.token;
+
+    storedWalletsService.updateStorageManagedWallet({ userId, token });
     setAccessToken(token);
     return token;
-  }, [isWalletConnected, isManaged, selectedChain, jwtTokenManager, address, consoleApiHttpClient]);
+  }, [isWalletConnected, userId, consoleApiHttpClient, storedWalletsService, setAccessToken]);
 
   return useMemo(
     () => ({
@@ -85,7 +76,7 @@ export function useProviderJwt({ dependencies: d = DEPENDENCIES }: { dependencie
       accessToken,
       generateToken
     }),
-    [accessToken, generateToken]
+    [accessToken, generateToken, parsedToken]
   );
 }
 
